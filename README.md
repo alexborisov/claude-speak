@@ -89,7 +89,7 @@ The same settings, plus the summary model, are also under the **claude-speak** r
 | :-- | :-- | :-- |
 | Speak every response | `on` | Speak each response automatically. Turn off to speak only when you run `/speak`. |
 | Summarize before speaking | `on` | Speak a short summary instead of the whole response. Responses under ~280 characters are always read in full. |
-| Voice | `af_heart` | Any Kokoro voice (see below). |
+| Voice | `af_heart` | Any Kokoro voice, or a cloned voice such as `clone:me` (see below). |
 | Speaking speed | `1.1` | From `0.5` to `2.0`. |
 | Summary model | `haiku` | The Claude model that writes the spoken summary. |
 
@@ -104,6 +104,21 @@ Kokoro has 54 voices. The first letter is the accent and the second is the voice
 | `af_heart` ⭐ `af_bella` `af_nicole` `af_sarah` `af_sky` `am_michael` `am_fenrir` `am_puck` `am_adam` | `bf_emma` `bf_isabella` `bf_alice` `bm_george` `bm_fable` `bm_lewis` `bm_daniel` |
 
 There are also Spanish (`e…`), French (`ff_siwis`), Hindi (`h…`), Italian (`i…`), Japanese (`j…`), Brazilian Portuguese (`p…`) and Mandarin (`z…`) voices. See the [full list and quality grades](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md).
+
+### Cloned voices (Apple Silicon)
+
+claude-speak can also speak in a voice cloned from a short recording, using [Chatterbox Turbo](https://huggingface.co/mlx-community/chatterbox-turbo-fp16) through [mlx-audio](https://github.com/Blaizzy/mlx-audio). Record 10 to 15 seconds of clear speech (QuickTime's **New Audio Recording** works; any format `afconvert` or `ffmpeg` can read is fine), then:
+
+```bash
+claude-speak voice add me ~/Desktop/me.m4a   # stored as clone:me
+claude-speak config --voice clone:me          # or pick it in /speak-settings
+claude-speak voice list                       # see your cloned voices
+claude-speak voice rm me
+```
+
+Only clone your own voice, or a voice you have permission to use.
+
+The first time a cloned voice speaks, the voice server restarts with mlx-audio and downloads the cloning model (about 1 to 2 GB), so that reply takes a while. After that, a two-sentence summary takes about 2 to 3 seconds on an M3. Cloned voices are English only, ignore the speed setting, and add about 1 GB to the server's memory while it runs. Kokoro voices work as before and never load the cloning model.
 
 ## How it works
 
@@ -152,6 +167,7 @@ These environment variables go in your shell profile, or under `env` in `~/.clau
 | `CLAUDE_SPEAK_MODEL` | `fp32` | `fp16` (~170 MB) or `int8` (~90 MB) for a smaller download and less memory. `fp32` sounds best. |
 | `CLAUDE_SPEAK_IDLE_TIMEOUT` | `1800` | Seconds before the idle voice server exits. |
 | `CLAUDE_SPEAK_PLAYER` | auto | Audio player command, e.g. `mpv --really-quiet`. |
+| `CLAUDE_SPEAK_CLONE_MODEL` | `mlx-community/chatterbox-turbo-fp16` | Hugging Face repo of the Chatterbox Turbo model used for cloned voices. |
 | `CLAUDE_SPEAK_LEAD_IN` | `2.0` | Seconds a sleeping output device (e.g. Bluetooth) gets to wake up before speech starts. claude-speak wakes it while the summary is written, so this usually adds no delay. Raise it if the start is still cut off, or lower it for wired speakers. |
 
 The voice server uses about 800 MB of RAM with the default model while it's running.

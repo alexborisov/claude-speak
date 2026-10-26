@@ -39,7 +39,7 @@
     "voice": {
       "type": "string",
       "title": "Voice",
-      "description": "Kokoro voice, e.g. af_heart, af_bella, am_michael, bf_emma, bm_george. See the README for the full list.",
+      "description": "Kokoro voice, e.g. af_heart, af_bella, am_michael, bf_emma, bm_george, or a cloned voice such as clone:me (Apple Silicon; add one with claude-speak voice add). See the README.",
       "default": "af_heart"
     },
     "speed": {

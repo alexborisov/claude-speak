@@ -11,16 +11,22 @@ Listens for HTTP on a unix socket in the data dir. Speech from different
 sessions is queued; a new /speak from the same session replaces its older one.
 Exits by itself after a period with nothing to do.
 
-  GET  /health   model, player and voices
+Voices named clone:<name> are cloned from <data>/voices/<name>.wav with
+Chatterbox Turbo. That needs mlx-audio (Apple Silicon), which the client adds
+with `uv run --with mlx-audio` only when a clone voice is in use.
+
+  GET  /health   model, player, voices and clone support
   POST /speak    {"text", "voice", "speed", "session", "label"}; returns at once, plays in turn
   POST /warm     play silence to wake the output device before speech is ready
   POST /synth    same body; returns the whole utterance as a WAV
   POST /stop     stop playback and clear the queue
+  POST /shutdown stop and exit, so the client can restart with other dependencies
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import io
 import json
 import os
@@ -74,6 +80,9 @@ STAY_AWAKE = 3.0
 # While another session has spoken this recently, speech starts with the name
 # of the project it came from.
 OTHERS_ACTIVE = 300.0
+
+CLONE_PREFIX = "clone:"
+CLONE_MODEL = os.environ.get("CLAUDE_SPEAK_CLONE_MODEL", "mlx-community/chatterbox-turbo-fp16")
 
 
 def log(message: str) -> None:
@@ -136,6 +145,49 @@ def wav_bytes(samples: np.ndarray, rate: int) -> bytes:
     return buf.getvalue()
 
 
+class CloneEngine:
+    """Speech in a cloned voice, from a short reference recording.
+
+    The model loads on first use, so setups that only use Kokoro voices never
+    pay for it. Speaker conditioning is computed once per reference file and
+    reused until the file changes. Chatterbox has no speed control.
+    """
+
+    def __init__(self, voices_dir: Path):
+        self.voices_dir = voices_dir
+        self.available = importlib.util.find_spec("mlx_audio") is not None
+        self.model = None
+        self.conds: dict[str, tuple[float, object]] = {}  # voice -> (ref mtime, conditionals)
+
+    def _ref(self, voice: str) -> Path:
+        return self.voices_dir / f"{voice[len(CLONE_PREFIX):]}.wav"
+
+    def voices(self) -> list[str]:
+        return sorted(CLONE_PREFIX + p.stem for p in self.voices_dir.glob("*.wav"))
+
+    def has(self, voice: str) -> bool:
+        return voice.startswith(CLONE_PREFIX) and self._ref(voice).exists()
+
+    def synth(self, text: str, voice: str) -> tuple[np.ndarray, int]:
+        if self.model is None:
+            # Progress bars would fill server.log on every utterance.
+            os.environ.setdefault("TQDM_DISABLE", "1")
+            os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+            from mlx_audio.tts.utils import load
+            started = time.time()
+            self.model = load(CLONE_MODEL)
+            log(f"loaded {CLONE_MODEL} in {time.time() - started:.1f}s")
+        ref = self._ref(voice)
+        mtime = ref.stat().st_mtime
+        cached = self.conds.get(voice)
+        if not cached or cached[0] != mtime:
+            self.model.prepare_conditionals(str(ref))
+            self.conds[voice] = (mtime, self.model._conds)
+        self.model._conds = self.conds[voice][1]
+        audio = [np.asarray(r.audio, dtype=np.float32) for r in self.model.generate(text)]
+        return np.concatenate(audio), self.model.sample_rate
+
+
 @dataclass
 class Job:
     session: str
@@ -153,8 +205,9 @@ class Speaker:
     queued, since that reply is out of date.
     """
 
-    def __init__(self, kokoro: Kokoro, player: list[str] | None, silence: Path):
+    def __init__(self, kokoro: Kokoro, clone: CloneEngine, player: list[str] | None, silence: Path):
         self.kokoro = kokoro
+        self.clone = clone
         self.player = player
         self.silence = silence
         self.voices = set(kokoro.get_voices())
@@ -174,11 +227,18 @@ class Speaker:
         threading.Thread(target=self._loop, daemon=True).start()
 
     def resolve_voice(self, voice: str) -> str:
-        return voice if voice in self.voices else "af_heart"
+        if voice in self.voices or (self.clone.available and self.clone.has(voice)):
+            return voice
+        if voice.startswith(CLONE_PREFIX):
+            reason = "no reference recording" if self.clone.available else "mlx-audio not installed"
+            log(f"can't use {voice} ({reason}); using af_heart")
+        return "af_heart"
 
     def synth(self, text: str, voice: str, speed: float) -> tuple[np.ndarray, int]:
         voice = self.resolve_voice(voice)
         with self.synth_lock:
+            if voice.startswith(CLONE_PREFIX):
+                return self.clone.synth(text, voice)
             return self.kokoro.create(text, voice=voice, speed=speed,
                                       lang=LANGS.get(voice[:1], "en-us"))
 
@@ -328,7 +388,9 @@ class Handler(BaseHTTPRequestHandler):
             speaker = self.server.speaker
             self._json(200, {"ok": True, "model": self.server.model_name,
                              "player": " ".join(speaker.player or ["none"]),
-                             "voices": sorted(speaker.voices)})
+                             "voices": sorted(speaker.voices),
+                             "clone": speaker.clone.available,
+                             "clone_voices": speaker.clone.voices()})
         else:
             self._json(404, {"error": "not found"})
 
@@ -343,6 +405,11 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/stop":
                 speaker.stop()
                 self._json(200, {"ok": True})
+            elif self.path == "/shutdown":
+                speaker.stop()
+                self._json(200, {"ok": True})
+                log("shutdown requested; exiting")
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
             elif self.path == "/warm":
                 speaker.warm()
                 self._json(202, {"ok": True})
@@ -360,7 +427,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(payload)
             else:
-                self._json(400, {"error": "expected /speak or /synth with text, /warm or /stop"})
+                self._json(400, {"error": "expected /speak or /synth with text, /warm, /stop or /shutdown"})
         except Exception as exc:
             self._json(500, {"error": str(exc)})
 
@@ -413,10 +480,12 @@ def main() -> None:
     kokoro = Kokoro(str(model_file), str(voices_file))
     silence = data / "silence.wav"
     silence.write_bytes(wav_bytes(np.zeros(WARM_SECS * 24000, np.float32), 24000))
-    speaker = Speaker(kokoro, find_player(), silence)
+    clone = CloneEngine(data / "voices")
+    speaker = Speaker(kokoro, clone, find_player(), silence)
     speaker.synth("Ready.", "af_heart", 1.0)  # warm up before accepting requests
     log(f"loaded {MODELS[args.model]} in {time.time() - started:.1f}s; "
-        f"player: {' '.join(speaker.player or ['none'])}")
+        f"player: {' '.join(speaker.player or ['none'])}; "
+        f"cloning: {'available' if clone.available else 'off'}")
 
     server = Server(str(sock), speaker, MODELS[args.model])
 

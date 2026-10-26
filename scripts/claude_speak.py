@@ -12,6 +12,7 @@ Subcommands:
   config [--voice V] [--speed S] [--auto on|off] [--summarize on|off] [--reset]
                     show or change settings (used by /speak-settings)
   say TEXT          speak arbitrary text; --out FILE writes a WAV instead
+  voice add|list|rm manage cloned voices (reference recordings), used as clone:NAME
   stop              stop playback
   status            show server and settings status
   setup             download the model and start the server
@@ -32,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import wave
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -64,6 +66,13 @@ VOICES = (
     "jf_alpha jf_gongitsune jf_nezumi jf_tebukuro jm_kumo pf_dora pm_alex pm_santa "
     "zf_xiaobei zf_xiaoni zf_xiaoxiao zf_xiaoyi zm_yunjian zm_yunxi zm_yunxia zm_yunyang"
 ).split()
+
+# Cloned voices are named clone:<name>, from a recording in <data>/voices/<name>.wav.
+# Chatterbox needs more than 5 seconds of reference and uses at most 15.
+CLONE_PREFIX = "clone:"
+CLONE_MIN_SECS = 5.5
+CLONE_MAX_SECS = 15
+CLONE_RATE = 24000
 
 # Settings that /speak-auto and /speak-settings can change without /config.
 OVERRIDABLE = ("auto_speak", "summarize", "voice", "speed")
@@ -183,6 +192,20 @@ def parse_speed(value) -> float | None:
     except ValueError:
         return None
     return round(speed, 2) if 0.5 <= speed <= 2.0 else None
+
+
+def voices_dir(data: Path) -> Path:
+    path = data / "voices"
+    path.mkdir(exist_ok=True)
+    return path
+
+
+def clone_voices(data: Path) -> list[str]:
+    return sorted(CLONE_PREFIX + p.stem for p in voices_dir(data).glob("*.wav"))
+
+
+def is_clone(voice) -> bool:
+    return str(voice).startswith(CLONE_PREFIX)
 
 
 def _safe_id(session_id: str) -> str:
@@ -356,10 +379,20 @@ def server_health(data: Path) -> dict | None:
         return None
 
 
-def ensure_server(data: Path, wait: float = 900) -> dict:
-    """Start the TTS server if needed. The first start downloads the model."""
+def _wait_for_exit(data: Path, wait: float = 15) -> None:
+    deadline = time.time() + wait
+    while time.time() < deadline and server_health(data):
+        time.sleep(0.25)
+
+
+def ensure_server(data: Path, clone: bool = False, wait: float = 900) -> dict:
+    """Start the TTS server if needed. The first start downloads the model.
+
+    clone adds mlx-audio for cloned voices; a running server without it is
+    restarted with it.
+    """
     health = server_health(data)
-    if health:
+    if health and (health.get("clone") or not clone):
         return health
     uv = shutil.which("uv")
     if not uv:
@@ -368,11 +401,15 @@ def ensure_server(data: Path, wait: float = 900) -> dict:
     with open(data / "server.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         health = server_health(data)
-        if health:
+        if health and (health.get("clone") or not clone):
             return health
+        if health:
+            request(data, "POST", "/shutdown")
+            _wait_for_exit(data)
         log = open(data / "server.log", "ab")
         server = subprocess.Popen(
-            [uv, "run", "--quiet", "--script", str(SERVER_SCRIPT),
+            [uv, "run", "--quiet", *(["--with", "mlx-audio"] if clone else []),
+             "--script", str(SERVER_SCRIPT),
              "--data-dir", str(data), "--socket", str(socket_path(data))],
             stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
         )
@@ -388,7 +425,7 @@ def ensure_server(data: Path, wait: float = 900) -> dict:
 def send_to_server(data: Path, text: str, settings: dict, session: str = "", label: str = "") -> None:
     """Queue speech. session lets a newer reply replace an older one; label names
     the project aloud when other sessions are speaking too."""
-    ensure_server(data)
+    ensure_server(data, clone=is_clone(settings["voice"]))
     request(data, "POST", "/speak",
             {"text": text, "voice": settings["voice"], "speed": settings["speed"],
              "session": session, "label": label})
@@ -542,8 +579,12 @@ def cmd_config(args) -> None:
     changes, problems = {}, []
     if args.voice is not None:
         voice = args.voice.strip().lower()
-        if voice in VOICES:
+        if voice in VOICES or voice in clone_voices(data):
             changes["voice"] = voice
+        elif is_clone(voice):
+            have = ", ".join(clone_voices(data)) or "none yet"
+            problems.append(f"no cloned voice '{args.voice}' (you have: {have}). "
+                            f"Add one with: claude-speak voice add NAME RECORDING")
         else:
             close = [v for v in VOICES if v[:2] == voice[:2]] or VOICES[:8]
             problems.append(f"unknown voice '{args.voice}'. Try one of: {', '.join(close)}")
@@ -575,11 +616,12 @@ def cmd_config(args) -> None:
             shown = ("on" if value else "off") if isinstance(value, bool) else (
                 f"{value:g}x" if key == "speed" else value)
             print(f"  {label}: {shown} ({_source(data, key)})")
+        print(f"  cloned voices: {', '.join(clone_voices(data)) or 'none'}")
         return
 
     print(f"claude-speak: saved. Now using {_describe(settings)}.")
     if args.preview and ("voice" in changes or "speed" in changes):
-        name = settings["voice"].split("_", 1)[-1].replace("_", " ").title()
+        name = re.split(r"[_:]", settings["voice"], maxsplit=1)[-1].replace("_", " ").title()
         sample = f"Hi, I'm {name}. This is how I'll sound when Claude finishes a task."
         if _safe_id(args.session or ""):
             (data / f"skip-{_safe_id(args.session)}").touch()
@@ -592,7 +634,7 @@ def cmd_say(args) -> None:
     settings = _skill_settings(args, data)
     text = speakable(" ".join(args.text))
     if args.out:
-        ensure_server(data)
+        ensure_server(data, clone=is_clone(settings["voice"]))
         status, body = request(data, "POST", "/synth",
                                {"text": text, "voice": settings["voice"], "speed": settings["speed"]},
                                timeout=300)
@@ -602,6 +644,74 @@ def cmd_say(args) -> None:
         print(f"claude-speak: wrote {args.out}")
     else:
         send_to_server(data, text, settings)
+
+
+def _convert(src: Path, dest: Path) -> None:
+    """Any audio file to mono 16-bit WAV at CLONE_RATE."""
+    if shutil.which("afconvert"):
+        cmd = ["afconvert", "-f", "WAVE", "-d", f"LEI16@{CLONE_RATE}", "-c", "1", str(src), str(dest)]
+    elif shutil.which("ffmpeg"):
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
+               "-ac", "1", "-ar", str(CLONE_RATE), "-sample_fmt", "s16", str(dest)]
+    else:
+        raise RuntimeError("converting audio needs afconvert (macOS) or ffmpeg")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"couldn't read {src}: {(result.stderr or result.stdout).strip()}")
+
+
+def _trim(path: Path) -> float:
+    """Cut a WAV to CLONE_MAX_SECS; returns its length in seconds."""
+    with wave.open(str(path), "rb") as w:
+        params, rate = w.getparams(), w.getframerate()
+        frames = w.readframes(min(w.getnframes(), CLONE_MAX_SECS * rate))
+    with wave.open(str(path), "wb") as w:
+        w.setparams(params)
+        w.writeframes(frames)
+    return len(frames) / (params.sampwidth * params.nchannels) / rate
+
+
+def cmd_voice(args) -> None:
+    data = data_dir(args.data_dir)
+    folder = voices_dir(data)
+    if args.action == "list":
+        names = clone_voices(data)
+        print("claude-speak: cloned voices: " + (", ".join(names) if names else
+              "none. Add one with: claude-speak voice add NAME RECORDING"))
+        return
+
+    name = (args.name or "").strip().lower()
+    if name.startswith(CLONE_PREFIX):
+        name = name[len(CLONE_PREFIX):]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name):
+        sys.exit("claude-speak: give a voice name of letters, digits, - or _, e.g. 'me'")
+    dest = folder / f"{name}.wav"
+
+    if args.action == "rm":
+        dest.unlink(missing_ok=True)
+        if load_settings(data=data)["voice"] == CLONE_PREFIX + name:
+            save_overrides(data, {"voice": None})
+            print("claude-speak: that was your current voice, so it's back to your /config voice.")
+        print(f"claude-speak: removed {CLONE_PREFIX}{name}.")
+        return
+
+    src = Path(args.file or "").expanduser()
+    if not src.is_file():
+        sys.exit(f"claude-speak: no such recording: {args.file}")
+    tmp = folder / f".{name}.tmp.wav"
+    try:
+        _convert(src, tmp)
+        secs = _trim(tmp)
+        if secs < CLONE_MIN_SECS:
+            sys.exit(f"claude-speak: the recording is {secs:.1f}s; cloning needs at least "
+                     f"{CLONE_MIN_SECS:g}s of clear speech (10-15s works best).")
+        tmp.replace(dest)
+    finally:
+        tmp.unlink(missing_ok=True)
+    print(f"claude-speak: added {CLONE_PREFIX}{name} ({secs:.1f}s). Use it with "
+          f"/speak-settings or: claude-speak config --voice {CLONE_PREFIX}{name}")
+    print("claude-speak: only clone your own voice or one you have permission to use. "
+          "The first use downloads the cloning model (~1-2 GB).")
 
 
 def cmd_stop(args) -> None:
@@ -618,16 +728,18 @@ def cmd_status(args) -> None:
     print(f"data dir:    {data}")
     print(f"settings:    {_describe(settings)}")
     print(f"server:      {'running' if health else 'not running'}")
+    print(f"cloned:      {', '.join(clone_voices(data)) or 'none'}")
     if health:
         print(f"model:       {health.get('model')}")
         print(f"player:      {health.get('player')}")
         print(f"voices:      {len(health.get('voices', []))} available")
+        print(f"cloning:     {'loaded' if health.get('clone') else 'not loaded'}")
 
 
 def cmd_setup(args) -> None:
     data = data_dir(args.data_dir)
     print("claude-speak: installing dependencies and downloading the Kokoro model (first run only)...")
-    health = ensure_server(data)
+    health = ensure_server(data, clone=is_clone(load_settings(data=data)["voice"]))
     print(f"claude-speak: ready. Model {health.get('model')}, audio via {health.get('player')}.")
 
 
@@ -670,18 +782,25 @@ def main() -> None:
     p.add_argument("--out")
     p.add_argument("text", nargs="+")
 
+    p = sub.add_parser("voice")
+    p.add_argument("--data-dir")
+    p.add_argument("action", choices=("add", "list", "rm"))
+    p.add_argument("name", nargs="?")
+    p.add_argument("file", nargs="?", help="recording to clone from (add only)")
+
     for name in ("stop", "status", "setup"):
         sub.add_parser(name).add_argument("--data-dir")
 
     args, _unknown = parser.parse_known_args()
     handler = {"hook": cmd_hook, "_worker": cmd_worker, "speak": cmd_speak, "auto": cmd_auto,
-               "config": cmd_config, "say": cmd_say, "stop": cmd_stop, "status": cmd_status, "setup": cmd_setup}[args.cmd]
+               "config": cmd_config, "say": cmd_say, "voice": cmd_voice, "stop": cmd_stop,
+               "status": cmd_status, "setup": cmd_setup}[args.cmd]
     try:
         handler(args)
     except Exception as exc:
         # Never fail a hook or a skill render over speech.
         print(f"claude-speak: {exc}")
-        if args.cmd in ("say", "setup"):
+        if args.cmd in ("say", "setup", "voice"):
             sys.exit(1)
 
 

@@ -18,7 +18,7 @@ Above are claude-speak's current settings. Keep your final reply short, with no 
 
 **Otherwise,** show one AskUserQuestion menu with these four questions, in this order. Append " (current)" to each option label that matches a current setting. If the current voice isn't one of the four listed, add "Currently <voice>." to the end of the voice question.
 
-1. Header "Voice", question "Which voice should read Claude's responses? Choose Other to type any Kokoro voice, e.g. af_bella, am_fenrir, bf_isabella, bm_fable.", options:
+1. Header "Voice", question "Which voice should read Claude's responses? Choose Other to type any Kokoro voice, e.g. af_bella, am_fenrir, bf_isabella, bm_fable." If the settings above list any cloned voices, add " Or a cloned voice: <the cloned voices, comma-separated>." to the question. Options:
    - "af_heart", description "American English, female. Warm and natural (default)."
    - "am_michael", description "American English, male. Calm and clear."
    - "bf_emma", description "British English, female. Crisp and bright."
