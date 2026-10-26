@@ -420,6 +420,9 @@ def spawn_worker(data: Path, text: str, settings: dict, force_full: bool = False
 def cmd_hook(args) -> None:
     if os.environ.get("CLAUDE_SPEAK_NESTED"):
         return
+    # Headless `claude -p` / SDK sessions (e.g. memory extractors) aren't the user's agents.
+    if os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk"):
+        return
     try:
         event = json.load(sys.stdin)
     except ValueError:
