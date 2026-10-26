@@ -41,6 +41,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 import wave
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler
@@ -82,6 +83,7 @@ STAY_AWAKE = 3.0
 OTHERS_ACTIVE = 300.0
 
 CLONE_PREFIX = "clone:"
+CLONE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]*")
 CLONE_MODEL = os.environ.get("CLAUDE_SPEAK_CLONE_MODEL", "mlx-community/chatterbox-turbo-fp16")
 
 
@@ -151,6 +153,10 @@ class CloneEngine:
     The model loads on first use, so setups that only use Kokoro voices never
     pay for it. Speaker conditioning is computed once per reference file and
     reused until the file changes. Chatterbox has no speed control.
+
+    All MLX work runs on one dedicated thread: it serializes cloned speech
+    without holding up Kokoro during the first model download, and keeps MLX
+    state on the thread that created it.
     """
 
     def __init__(self, voices_dir: Path):
@@ -158,17 +164,24 @@ class CloneEngine:
         self.available = importlib.util.find_spec("mlx_audio") is not None
         self.model = None
         self.conds: dict[str, tuple[float, object]] = {}  # voice -> (ref mtime, conditionals)
+        self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="clone")
 
-    def _ref(self, voice: str) -> Path:
-        return self.voices_dir / f"{voice[len(CLONE_PREFIX):]}.wav"
+    def _ref(self, voice: str) -> Path | None:
+        name = voice[len(CLONE_PREFIX):] if voice.startswith(CLONE_PREFIX) else ""
+        return self.voices_dir / f"{name}.wav" if CLONE_NAME.fullmatch(name) else None
 
     def voices(self) -> list[str]:
-        return sorted(CLONE_PREFIX + p.stem for p in self.voices_dir.glob("*.wav"))
+        return sorted(CLONE_PREFIX + p.stem for p in self.voices_dir.glob("*.wav")
+                      if CLONE_NAME.fullmatch(p.stem))
 
     def has(self, voice: str) -> bool:
-        return voice.startswith(CLONE_PREFIX) and self._ref(voice).exists()
+        ref = self._ref(voice)
+        return ref is not None and ref.exists()
 
     def synth(self, text: str, voice: str) -> tuple[np.ndarray, int]:
+        return self.worker.submit(self._synth, text, voice).result()
+
+    def _synth(self, text: str, voice: str) -> tuple[np.ndarray, int]:
         if self.model is None:
             # Progress bars would fill server.log on every utterance.
             os.environ.setdefault("TQDM_DISABLE", "1")
@@ -236,11 +249,19 @@ class Speaker:
 
     def synth(self, text: str, voice: str, speed: float) -> tuple[np.ndarray, int]:
         voice = self.resolve_voice(voice)
-        with self.synth_lock:
-            if voice.startswith(CLONE_PREFIX):
+        if voice.startswith(CLONE_PREFIX):
+            try:
                 return self.clone.synth(text, voice)
+            except Exception as exc:
+                log(f"cloned voice {voice} failed ({exc}); using af_heart")
+                voice = "af_heart"
+        with self.synth_lock:
             return self.kokoro.create(text, voice=voice, speed=speed,
                                       lang=LANGS.get(voice[:1], "en-us"))
+
+    def idle(self) -> bool:
+        with self.state_lock:
+            return not self.current and not self.queue
 
     def stop(self) -> None:
         """Stop everything: what's playing and what's queued."""
@@ -406,7 +427,9 @@ class Handler(BaseHTTPRequestHandler):
                 speaker.stop()
                 self._json(200, {"ok": True})
             elif self.path == "/shutdown":
-                speaker.stop()
+                if not speaker.idle():
+                    self._json(409, {"error": "busy speaking"})
+                    return
                 self._json(200, {"ok": True})
                 log("shutdown requested; exiting")
                 threading.Thread(target=self.server.shutdown, daemon=True).start()

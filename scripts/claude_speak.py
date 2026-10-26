@@ -26,6 +26,7 @@ import hashlib
 import http.client
 import json
 import os
+import platform
 import re
 import shutil
 import socket
@@ -73,6 +74,8 @@ CLONE_PREFIX = "clone:"
 CLONE_MIN_SECS = 5.5
 CLONE_MAX_SECS = 15
 CLONE_RATE = 24000
+# mlx-audio only runs on Apple Silicon.
+CLONE_SUPPORTED = sys.platform == "darwin" and platform.machine() == "arm64"
 
 # Settings that /speak-auto and /speak-settings can change without /config.
 OVERRIDABLE = ("auto_speak", "summarize", "voice", "speed")
@@ -201,7 +204,8 @@ def voices_dir(data: Path) -> Path:
 
 
 def clone_voices(data: Path) -> list[str]:
-    return sorted(CLONE_PREFIX + p.stem for p in voices_dir(data).glob("*.wav"))
+    return sorted(CLONE_PREFIX + p.stem for p in voices_dir(data).glob("*.wav")
+                  if not p.name.startswith("."))
 
 
 def is_clone(voice) -> bool:
@@ -385,12 +389,31 @@ def _wait_for_exit(data: Path, wait: float = 15) -> None:
         time.sleep(0.25)
 
 
+def _start_server(data: Path, uv: str, clone: bool, wait: float) -> dict | None:
+    with open(data / "server.log", "ab") as log:
+        server = subprocess.Popen(
+            [uv, "run", "--quiet", *(["--with", "mlx-audio"] if clone else []),
+             "--script", str(SERVER_SCRIPT),
+             "--data-dir", str(data), "--socket", str(socket_path(data))],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+        )
+    deadline = time.time() + wait
+    while time.time() < deadline and server.poll() is None:
+        time.sleep(0.5)
+        health = server_health(data)
+        if health:
+            return health
+    return None
+
+
 def ensure_server(data: Path, clone: bool = False, wait: float = 900) -> dict:
     """Start the TTS server if needed. The first start downloads the model.
 
-    clone adds mlx-audio for cloned voices; a running server without it is
-    restarted with it.
+    clone adds mlx-audio for cloned voices. A running server without it is
+    restarted with it, unless it's busy speaking: then it's used as it is (the
+    clone voice falls back to Kokoro) and the next reply tries again.
     """
+    clone = clone and CLONE_SUPPORTED
     health = server_health(data)
     if health and (health.get("clone") or not clone):
         return health
@@ -404,31 +427,38 @@ def ensure_server(data: Path, clone: bool = False, wait: float = 900) -> dict:
         if health and (health.get("clone") or not clone):
             return health
         if health:
-            request(data, "POST", "/shutdown")
-            _wait_for_exit(data)
-        log = open(data / "server.log", "ab")
-        server = subprocess.Popen(
-            [uv, "run", "--quiet", *(["--with", "mlx-audio"] if clone else []),
-             "--script", str(SERVER_SCRIPT),
-             "--data-dir", str(data), "--socket", str(socket_path(data))],
-            stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
-        )
-        deadline = time.time() + wait
-        while time.time() < deadline and server.poll() is None:
-            time.sleep(0.5)
-            health = server_health(data)
-            if health:
+            try:
+                status, _ = request(data, "POST", "/shutdown")
+            except (OSError, http.client.HTTPException):
+                status = 200  # it went away by itself
+            if status != 200:  # busy, or a server from before /shutdown existed
                 return health
+            _wait_for_exit(data)
+            if server_health(data):
+                return health
+        health = _start_server(data, uv, clone, wait)
+        if not health and clone:
+            # mlx-audio couldn't be installed or loaded; keep Kokoro voices working.
+            log_error(data, "couldn't start the voice server with mlx-audio; cloned voices are off")
+            health = _start_server(data, uv, False, wait)
+        if health:
+            return health
     raise RuntimeError(f"the TTS server did not start; see {data / 'server.log'}")
 
 
 def send_to_server(data: Path, text: str, settings: dict, session: str = "", label: str = "") -> None:
     """Queue speech. session lets a newer reply replace an older one; label names
     the project aloud when other sessions are speaking too."""
-    ensure_server(data, clone=is_clone(settings["voice"]))
-    request(data, "POST", "/speak",
-            {"text": text, "voice": settings["voice"], "speed": settings["speed"],
-             "session": session, "label": label})
+    clone = settings["voice"] in clone_voices(data)
+    body = {"text": text, "voice": settings["voice"], "speed": settings["speed"],
+            "session": session, "label": label}
+    ensure_server(data, clone=clone)
+    try:
+        request(data, "POST", "/speak", body)
+    except (OSError, http.client.HTTPException):
+        # The server was restarting for another reply; wait for it and retry once.
+        ensure_server(data, clone=clone)
+        request(data, "POST", "/speak", body)
 
 
 def log_error(data: Path, message: str) -> None:
@@ -634,7 +664,7 @@ def cmd_say(args) -> None:
     settings = _skill_settings(args, data)
     text = speakable(" ".join(args.text))
     if args.out:
-        ensure_server(data, clone=is_clone(settings["voice"]))
+        ensure_server(data, clone=settings["voice"] in clone_voices(data))
         status, body = request(data, "POST", "/synth",
                                {"text": text, "voice": settings["voice"], "speed": settings["speed"]},
                                timeout=300)
@@ -739,7 +769,7 @@ def cmd_status(args) -> None:
 def cmd_setup(args) -> None:
     data = data_dir(args.data_dir)
     print("claude-speak: installing dependencies and downloading the Kokoro model (first run only)...")
-    health = ensure_server(data, clone=is_clone(load_settings(data=data)["voice"]))
+    health = ensure_server(data, clone=load_settings(data=data)["voice"] in clone_voices(data))
     print(f"claude-speak: ready. Model {health.get('model')}, audio via {health.get('player')}.")
 
 
