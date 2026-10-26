@@ -102,7 +102,12 @@ DEFAULTS = {
 def data_dir(explicit: str | None = None) -> Path:
     raw = explicit or os.environ.get("CLAUDE_PLUGIN_DATA") or os.environ.get("CLAUDE_SPEAK_DATA")
     if not raw or raw.startswith("${"):
-        raw = os.path.join(os.environ.get("XDG_DATA_HOME", "~/.local/share"), "claude-speak")
+        # Run from a terminal: use the installed plugin's data dir, so voices
+        # and settings added here are the ones the hook and skills see.
+        config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
+        installed = sorted((config_dir / "plugins" / "data").glob("claude-speak-*"))
+        raw = str(installed[0]) if installed else os.path.join(
+            os.environ.get("XDG_DATA_HOME", "~/.local/share"), "claude-speak")
     path = Path(raw).expanduser()
     path.mkdir(parents=True, exist_ok=True)
     return path
