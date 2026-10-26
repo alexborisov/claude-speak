@@ -16,8 +16,11 @@ Chatterbox Turbo. That needs mlx-audio (Apple Silicon), which the client adds
 with `uv run --with mlx-audio` only when a clone voice is in use.
 
   GET  /health   model, player, voices and clone support
-  POST /speak    {"text", "voice", "speed", "session", "label"}; returns at once, plays in turn
-  POST /warm     play silence to wake the output device before speech is ready
+  POST /speak    {"text", "voice", "speed", "session", "label", "more"}; returns at once,
+                 plays in turn. With "more": true, the rest follows through /append.
+  POST /append   {"session", "text", "more"}; continue that session's /speak
+  POST /warm     {"voice"}; play silence to wake the output device before speech is
+                 ready, and load a cloned voice
   POST /synth    same body; returns the whole utterance as a WAV
   POST /stop     stop playback and clear the queue
   POST /shutdown stop and exit, so the client can restart with other dependencies
@@ -43,7 +46,7 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -63,7 +66,19 @@ LANGS = {"a": "en-us", "b": "en-gb", "e": "es", "f": "fr-fr", "h": "hi",
          "i": "it", "j": "ja", "p": "pt-br", "z": "cmn"}
 
 # Start speaking after the first chunk instead of waiting for the whole text.
+# The first chunk is short so speech starts quickly; each later one may be up
+# to 1.5 times as long as the one before, since it's synthesized while that
+# one plays. Synthesis runs at about twice real time less a fixed cost per
+# chunk, so doubling would leave audible gaps.
+FIRST_CHUNK_CHARS = 50
 CHUNK_CHARS = 250
+MIN_CLAUSE_CHARS = 20
+
+# How long a streaming /speak waits for its next /append before giving up.
+STREAM_TIMEOUT = 20.0
+
+# Log the timing of every chunk (CLAUDE_SPEAK_DEBUG=1), for tuning latency.
+DEBUG = bool(os.environ.get("CLAUDE_SPEAK_DEBUG"))
 
 # How long the output must be playing before speech starts, so the first words
 # aren't lost while an idle device (Bluetooth especially) wakes up. Time already
@@ -122,15 +137,56 @@ def find_player() -> list[str] | None:
     return None
 
 
-def split_chunks(text: str) -> list[str]:
-    sentences = re.split(r"(?<=[.!?;:])\s+|\n+", text.strip())
+def chunk_limit(prev: int) -> int:
+    """Longest next chunk, given the length of the one before (0 for the first)."""
+    return min(CHUNK_CHARS, max(FIRST_CHUNK_CHARS, prev * 3 // 2))
+
+
+# Where a long sentence can be cut: after punctuation, or failing that, before
+# a conjunction, so each part still sounds like a phrase.
+CLAUSE_BREAKS = (re.compile(r"[,;:—–]\s+"),
+                 re.compile(r"\s+(?=(?:and|but|or|so|because|which|while|when|then|that|if)\s)"))
+
+
+def _split_clause(sentence: str, limit: int) -> tuple[str, str]:
+    """Cut a long sentence at its last clause break within limit or, if there is
+    none, at its first break after it. Both parts stay MIN_CLAUSE_CHARS or longer."""
+    cuts = [[m.end() for m in breaks.finditer(sentence)
+             if MIN_CLAUSE_CHARS <= m.end() <= len(sentence) - MIN_CLAUSE_CHARS]
+            for breaks in CLAUSE_BREAKS]
+    within = [max(c for c in kind if c <= limit) for kind in cuts if any(c <= limit for c in kind)]
+    beyond = [min(kind) for kind in cuts if kind]
+    cut = (within or beyond or [0])[0]
+    return (sentence[:cut].strip(), sentence[cut:].strip()) if cut else (sentence, "")
+
+
+def split_chunks(text: str, prev: int = 0) -> list[str]:
+    """Split text into chunks to synthesize one at a time. prev is the length of
+    the utterance's chunk before this text, for text that arrives in pieces."""
+    pending = [s.strip() for s in re.split(r"(?<=[.!?;:])\s+|\n+", text.strip()) if s.strip()]
     chunks, current = [], ""
-    for sentence in filter(None, (s.strip() for s in sentences)):
-        if current and len(current) + len(sentence) > CHUNK_CHARS:
+    while pending:
+        sentence = pending.pop(0)
+        limit = chunk_limit(len(chunks[-1]) if chunks else prev)
+        if current and len(current) + 1 + len(sentence) > limit:
+            if len(current) < MIN_CLAUSE_CHARS:
+                # A fragment such as "project name:" leads the next clause instead.
+                head, rest = _split_clause(sentence, limit - len(current) - 1)
+                if rest:
+                    chunks.append(f"{current} {head}")
+                    current = ""
+                    pending.insert(0, rest)
+                    continue
             chunks.append(current)
-            current = sentence
-        else:
-            current = f"{current} {sentence}".strip()
+            current = ""
+            limit = chunk_limit(len(chunks[-1]))
+        if not current and len(sentence) > limit:
+            head, rest = _split_clause(sentence, limit)
+            if rest:
+                chunks.append(head)
+                pending.insert(0, rest)
+                continue
+        current = f"{current} {sentence}".strip()
     if current:
         chunks.append(current)
     return chunks
@@ -181,7 +237,17 @@ class CloneEngine:
     def synth(self, text: str, voice: str) -> tuple[np.ndarray, int]:
         return self.worker.submit(self._synth, text, voice).result()
 
+    def preload(self, voice: str) -> None:
+        """Load the model and the voice in the background, ahead of speech."""
+        if self.available and self.has(voice):
+            self.worker.submit(self._prepare, voice)
+
     def _synth(self, text: str, voice: str) -> tuple[np.ndarray, int]:
+        self._prepare(voice)
+        audio = [np.asarray(r.audio, dtype=np.float32) for r in self.model.generate(text)]
+        return np.concatenate(audio), self.model.sample_rate
+
+    def _prepare(self, voice: str) -> None:
         if self.model is None:
             # Progress bars would fill server.log on every utterance.
             os.environ.setdefault("TQDM_DISABLE", "1")
@@ -197,8 +263,6 @@ class CloneEngine:
             self.model.prepare_conditionals(str(ref))
             self.conds[voice] = (mtime, self.model._conds)
         self.model._conds = self.conds[voice][1]
-        audio = [np.asarray(r.audio, dtype=np.float32) for r in self.model.generate(text)]
-        return np.concatenate(audio), self.model.sample_rate
 
 
 @dataclass
@@ -207,7 +271,26 @@ class Job:
     text: str
     voice: str
     speed: float
+    streaming: bool = False
     cancelled: bool = False
+    closed: bool = False
+    more: queue.Queue = field(default_factory=queue.Queue)  # appended text; None ends it
+
+    def cancel(self) -> None:
+        self.cancelled = True
+        self.more.put(None)
+
+    def pieces(self):
+        yield self.text
+        while self.streaming and not self.cancelled:
+            try:
+                piece = self.more.get(timeout=STREAM_TIMEOUT)
+            except queue.Empty:
+                log(f"no more text for {self.session[:8] or '-'} after {STREAM_TIMEOUT:g}s; finishing")
+                return
+            if piece is None:
+                return
+            yield piece
 
 
 class Speaker:
@@ -267,7 +350,7 @@ class Speaker:
         """Stop everything: what's playing and what's queued."""
         with self.state_lock:
             for job in self.queue:
-                job.cancelled = True
+                job.cancel()
             self.queue.clear()
             self._cancel_current()
             self._end_warm()
@@ -276,11 +359,12 @@ class Speaker:
     def _cancel_current(self) -> None:
         """Call with state_lock held."""
         if self.current:
-            self.current.cancelled = True
+            self.current.cancel()
             if self.proc and self.proc.poll() is None:
                 self.proc.terminate()
 
-    def warm(self) -> None:
+    def warm(self, voice: str = "") -> None:
+        self.clone.preload(voice)
         with self.state_lock:
             if (not self.player or self.current or self.queue
                     or any(p and p.poll() is None for p in (self.proc, self.warm_proc))):
@@ -316,7 +400,8 @@ class Speaker:
             woke = now - self.awake_since if awake else 0.0
         return max(MIN_LEAD_IN, LEAD_IN - woke)
 
-    def speak(self, text: str, voice: str, speed: float, session: str = "", label: str = "") -> None:
+    def speak(self, text: str, voice: str, speed: float, session: str = "", label: str = "",
+              more: bool = False) -> None:
         with self.state_lock:
             now = time.time()
             others = any(s != session and now - seen < OTHERS_ACTIVE for s, seen in self.last_seen.items())
@@ -325,13 +410,29 @@ class Speaker:
             if label and others:
                 text = f"{re.sub(r'[-_.]+', ' ', label)}: {text}"
             for job in self.queue:
-                job.cancelled |= job.session == session
+                if job.session == session:
+                    job.cancel()
             self.queue = [job for job in self.queue if not job.cancelled]
             if self.current and self.current.session == session:
                 self._cancel_current()
-            self.queue.append(Job(session, text, voice, speed))
+            self.queue.append(Job(session, text, voice, speed, streaming=more))
             self.busy_until = now + 3600
             self.wake.notify()
+
+    def append(self, session: str, text: str, more: bool) -> bool:
+        """Continue the session's streaming utterance; False if there isn't one."""
+        with self.state_lock:
+            jobs = [j for j in [self.current, *self.queue]
+                    if j and j.session == session and j.streaming and not j.closed and not j.cancelled]
+            if not jobs:
+                return False
+            job = jobs[-1]
+            if text:
+                job.more.put(text)
+            if not more:
+                job.closed = True
+                job.more.put(None)
+            return True
 
     def _loop(self) -> None:
         while True:
@@ -348,18 +449,26 @@ class Speaker:
                         self.busy_until = time.time()
 
     def _run(self, job: Job) -> None:
-        text, voice, speed = job.text, job.voice, job.speed
+        voice, speed = job.voice, job.speed
         if not self.player:
             log("no audio player found (tried afplay, pw-play, paplay, aplay, ffplay)")
             return
         clips: queue.Queue = queue.Queue(maxsize=2)
+        prev = [0]  # length of the last chunk, so pieces that arrive later keep growing
 
         def produce():
             try:
-                for i, chunk in enumerate(split_chunks(text)):
+                chunks = (chunk for piece in job.pieces()
+                          for chunk in split_chunks(piece, prev=prev[0]))
+                for i, chunk in enumerate(chunks):
                     if job.cancelled:
                         break
+                    prev[0] = len(chunk)
+                    started = time.time()
                     samples, rate = self.synth(chunk, voice, speed)
+                    if DEBUG:
+                        log(f"chunk {i}: {len(chunk)} chars in {time.time() - started:.2f}s "
+                            f"-> {len(samples) / rate:.2f}s audio: {chunk!r}")
                     if i == 0:
                         lead = np.zeros(int(self.lead_in() * rate), samples.dtype)
                         samples = np.concatenate([lead, samples])
@@ -434,13 +543,19 @@ class Handler(BaseHTTPRequestHandler):
                 log("shutdown requested; exiting")
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
             elif self.path == "/warm":
-                speaker.warm()
+                speaker.warm(str(body.get("voice") or ""))
                 self._json(202, {"ok": True})
             elif self.path == "/speak" and text:
                 session = str(body.get("session") or "")
                 log(f"speak [{voice} x{speed}] {session[:8] or '-'}: {text[:100]!r}{'...' if len(text) > 100 else ''}")
-                speaker.speak(text, voice, speed, session, str(body.get("label") or ""))
+                speaker.speak(text, voice, speed, session, str(body.get("label") or ""),
+                              more=bool(body.get("more")))
                 self._json(202, {"ok": True})
+            elif self.path == "/append":
+                if speaker.append(str(body.get("session") or ""), text, bool(body.get("more"))):
+                    self._json(202, {"ok": True})
+                else:
+                    self._json(404, {"error": "no open /speak for that session"})
             elif self.path == "/synth" and text:
                 samples, rate = speaker.synth(text, voice, speed)
                 payload = wav_bytes(samples, rate)
@@ -450,7 +565,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(payload)
             else:
-                self._json(400, {"error": "expected /speak or /synth with text, /warm, /stop or /shutdown"})
+                self._json(400, {"error": "expected /speak or /synth with text, /append, /warm, /stop or /shutdown"})
         except Exception as exc:
             self._json(500, {"error": str(exc)})
 

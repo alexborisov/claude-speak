@@ -33,6 +33,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import wave
 from pathlib import Path
@@ -46,6 +47,9 @@ SUMMARY_THRESHOLD = 280
 MAX_SPOKEN_CHARS = 3000
 # Marker the /speak skill replies with; never treated as a response to speak.
 SPEAK_MARKER = "🔊"
+
+# Where a streamed summary is cut into sentences to speak as they arrive.
+SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 
 SUMMARY_PROMPT = (
     "You are the voice of a coding assistant. The user message contains, inside "
@@ -320,28 +324,55 @@ def speakable(markdown: str) -> str:
     return text
 
 
-def summarize(text: str, model: str) -> str:
+def summarize(text: str, model: str):
+    """Yield the spoken summary a sentence at a time, as Claude writes it, so
+    speech can start before the summary is finished. Yields the reply itself
+    if no summary comes back."""
     claude = shutil.which("claude")
     if not claude:
-        return text
+        yield text
+        return
     # Extended thinking makes a two-sentence summary take ~30s instead of ~3s.
     env = dict(os.environ, CLAUDE_SPEAK_NESTED="1", MAX_THINKING_TOKENS="0")
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             [claude, "-p", "--model", model, "--tools", "", "--no-session-persistence",
-             "--strict-mcp-config", "--system-prompt", SUMMARY_PROMPT],
-            input=f"<reply>\n{text}\n</reply>", cwd=tempfile.gettempdir(), capture_output=True, text=True, timeout=90, env=env,
+             "--strict-mcp-config", "--system-prompt", SUMMARY_PROMPT,
+             "--output-format", "stream-json", "--verbose", "--include-partial-messages"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, cwd=tempfile.gettempdir(), env=env,
         )
-    except (subprocess.TimeoutExpired, OSError):
-        return text
-    summary = result.stdout.strip()
-    return summary if result.returncode == 0 and summary else text
-
-
-def prepare(text: str, settings: dict, force_full: bool = False) -> str:
-    if settings["summarize"] and not force_full and len(text) > SUMMARY_THRESHOLD:
-        text = summarize(text, settings["summary_model"])
-    return speakable(text)
+    except OSError:
+        yield text
+        return
+    timer = threading.Timer(90, proc.kill)
+    timer.start()
+    buffer, said = "", False
+    try:
+        proc.stdin.write(f"<reply>\n{text}\n</reply>")
+        proc.stdin.close()
+        for line in proc.stdout:
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            delta = (event.get("event") or {}).get("delta") or {}
+            if event.get("type") != "stream_event" or delta.get("type") != "text_delta":
+                continue
+            *done, buffer = SENTENCE_END.split(buffer + delta.get("text", ""))
+            for sentence in filter(str.strip, done):
+                said = True
+                yield sentence
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+    if buffer.strip():
+        said = True
+        yield buffer
+    if not said:
+        yield text
 
 
 # --------------------------------------------------------------------------
@@ -451,12 +482,14 @@ def ensure_server(data: Path, clone: bool = False, wait: float = 900) -> dict:
     raise RuntimeError(f"the TTS server did not start; see {data / 'server.log'}")
 
 
-def send_to_server(data: Path, text: str, settings: dict, session: str = "", label: str = "") -> None:
+def send_to_server(data: Path, text: str, settings: dict, session: str = "", label: str = "",
+                   more: bool = False) -> None:
     """Queue speech. session lets a newer reply replace an older one; label names
-    the project aloud when other sessions are speaking too."""
+    the project aloud when other sessions are speaking too. With more, the rest
+    of the text follows through append_to_server."""
     clone = settings["voice"] in clone_voices(data)
     body = {"text": text, "voice": settings["voice"], "speed": settings["speed"],
-            "session": session, "label": label}
+            "session": session, "label": label, "more": more}
     ensure_server(data, clone=clone)
     try:
         request(data, "POST", "/speak", body)
@@ -464,6 +497,11 @@ def send_to_server(data: Path, text: str, settings: dict, session: str = "", lab
         # The server was restarting for another reply; wait for it and retry once.
         ensure_server(data, clone=clone)
         request(data, "POST", "/speak", body)
+
+
+def append_to_server(data: Path, session: str, text: str, more: bool) -> None:
+    """Continue the session's speech started with send_to_server(more=True)."""
+    request(data, "POST", "/append", {"session": session, "text": text, "more": more})
 
 
 def log_error(data: Path, message: str) -> None:
@@ -531,15 +569,43 @@ def cmd_hook(args) -> None:
 def cmd_worker(args) -> None:
     data = data_dir(args.data_dir)
     job = json.load(sys.stdin)
+    settings, session = job["settings"], job.get("session", "")
     try:
-        # Wake the output device while the summary is written, if the server is up.
-        if server_health(data):
-            request(data, "POST", "/warm")
-        text = prepare(job["text"], job["settings"], job.get("force_full", False))
-        if text:
-            send_to_server(data, text, job["settings"], job.get("session", ""), job.get("label", ""))
+        text = job["text"]
+        if not (settings["summarize"] and not job.get("force_full") and len(text) > SUMMARY_THRESHOLD):
+            text = speakable(text)
+            if text:
+                send_to_server(data, text, settings, session, job.get("label", ""))
+            return
+
+        # Start the server, wake the output device and load a cloned voice
+        # while the summary is written.
+        threading.Thread(target=_warm_up, args=(data, settings), daemon=True).start()
+        started = False
+        try:
+            for sentence in summarize(text, settings["summary_model"]):
+                sentence = speakable(sentence)
+                if not sentence:
+                    continue
+                if not started:
+                    send_to_server(data, sentence, settings, session, job.get("label", ""), more=True)
+                    started = True
+                else:
+                    append_to_server(data, session, sentence, more=True)
+        finally:
+            # Always close the stream, so other sessions aren't kept waiting.
+            if started:
+                append_to_server(data, session, "", more=False)
     except Exception as exc:  # detached: the log is the only place errors can go
         log_error(data, f"speak failed: {exc}")
+
+
+def _warm_up(data: Path, settings: dict) -> None:
+    try:
+        ensure_server(data, clone=settings["voice"] in clone_voices(data))
+        request(data, "POST", "/warm", {"voice": settings["voice"]})
+    except Exception as exc:
+        log_error(data, f"warm-up failed: {exc}")
 
 
 def _skill_settings(args, data: Path) -> dict:
