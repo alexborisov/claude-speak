@@ -137,7 +137,7 @@ The first time a cloned voice speaks, the voice server restarts with mlx-audio a
 
 - A **Stop hook** runs when Claude finishes a response. It returns in about 50 ms and does the rest in a detached background process, so it never slows Claude down.
 - The **summary** is written by a one-off `claude -p` call using your existing Claude Code login, with no tools, MCP servers or extended thinking. It's streamed: each sentence goes to the voice server as soon as Claude finishes writing it, so speech usually starts about 4 seconds after Claude does, before the summary is complete.
-- The **voice server** is a small Python process (managed by `uv`) that keeps Kokoro loaded and listens on a local Unix socket. It starts on first use and exits after 30 idle minutes. Text is synthesized in chunks while earlier chunks play: the first is a short clause so audio begins right away, and each later one can be up to 1.5 times as long as the one before, which keeps synthesis ahead of playback with no gaps. When several sessions finish at once they take turns instead of talking over each other, and each reply starts with its project name so you know which one is talking. A newer reply from the same session replaces its older one.
+- The **voice server** is a small Python process (managed by `uv`) that keeps Kokoro loaded and listens on a local Unix socket. It starts on first use and exits after 30 idle minutes. Text is synthesized in chunks while earlier chunks play: the first is a short clause so audio begins right away, and each later one can be up to 1.5 times as long as the one before, which keeps synthesis ahead of playback. All the chunks of a reply play through one continuous audio stream, so they sound like one piece of speech rather than separate clips. When several sessions finish at once they take turns instead of talking over each other, and each reply starts with its project name so you know which one is talking. A newer reply from the same session replaces its older one.
 
 ### Privacy
 
@@ -166,7 +166,7 @@ These environment variables go in your shell profile, or under `env` in `~/.clau
 | :-- | :-- | :-- |
 | `CLAUDE_SPEAK_MODEL` | `fp32` | `fp16` (~170 MB) or `int8` (~90 MB) for a smaller download and less memory. `fp32` sounds best. |
 | `CLAUDE_SPEAK_IDLE_TIMEOUT` | `1800` | Seconds before the idle voice server exits. |
-| `CLAUDE_SPEAK_PLAYER` | auto | Audio player command, e.g. `mpv --really-quiet`. |
+| `CLAUDE_SPEAK_PLAYER` | auto | Audio player command, e.g. `mpv --really-quiet`. Setting it plays each chunk as a separate file, which leaves short pauses between them. |
 | `CLAUDE_SPEAK_CLONE_MODEL` | `mlx-community/chatterbox-turbo-fp16` | Hugging Face repo of the Chatterbox Turbo model used for cloned voices. |
 | `CLAUDE_SPEAK_DEBUG` | off | Set to `1` to log each chunk's text, synthesis time and audio length to `server.log`, for tuning latency. |
 | `CLAUDE_SPEAK_LEAD_IN` | `2.0` | Seconds a sleeping output device (e.g. Bluetooth) gets to wake up before speech starts. claude-speak wakes it while the summary is written, so this usually adds no delay. Raise it if the start is still cut off, or lower it for wired speakers. |

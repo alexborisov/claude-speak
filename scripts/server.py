@@ -3,6 +3,7 @@
 # dependencies = [
 #     "kokoro-onnx>=0.4,<1",
 #     "numpy>=2",
+#     "sounddevice>=0.5",
 # ]
 # ///
 """claude-speak TTS server: keeps Kokoro loaded and plays speech on request.
@@ -97,6 +98,9 @@ STAY_AWAKE = 3.0
 # of the project it came from.
 OTHERS_ACTIVE = 300.0
 
+# Samples written to the output stream at a time; stopping takes about this long.
+STREAM_BLOCK_SECS = 0.1
+
 CLONE_PREFIX = "clone:"
 CLONE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]*")
 CLONE_MODEL = os.environ.get("CLAUDE_SPEAK_CLONE_MODEL", "mlx-community/chatterbox-turbo-fp16")
@@ -117,6 +121,20 @@ def download(name: str, dest_dir: Path) -> Path:
     part.rename(dest)
     log(f"downloaded {name} ({dest.stat().st_size // (1 << 20)} MB)")
     return dest
+
+
+def open_stream_api():
+    """sounddevice, for playing a whole utterance through one continuous output
+    stream, or None to play each chunk with the player instead. Starting a player
+    per chunk leaves a gap between chunks (about half a second for afplay)."""
+    if os.environ.get("CLAUDE_SPEAK_PLAYER"):
+        return None
+    try:
+        import sounddevice
+        sounddevice.query_devices(kind="output")
+        return sounddevice
+    except Exception:  # not installed, no PortAudio, or no output device
+        return None
 
 
 def find_player() -> list[str] | None:
@@ -305,6 +323,7 @@ class Speaker:
         self.kokoro = kokoro
         self.clone = clone
         self.player = player
+        self.sd = open_stream_api()
         self.silence = silence
         self.voices = set(kokoro.get_voices())
         self.synth_lock = threading.Lock()
@@ -376,21 +395,28 @@ class Speaker:
         if self.warm_proc and self.warm_proc.poll() is None:
             self.warm_proc.terminate()
 
-    def _spawn(self, path: Path | str) -> subprocess.Popen:
-        """Start the player; call with state_lock held."""
+    def _started_playing(self) -> None:
+        """Call with state_lock held."""
         now = time.time()
         if self.playing == 0 and now - self.quiet_since > STAY_AWAKE:
             self.awake_since = now
         self.playing += 1
+
+    def _stopped_playing(self) -> None:
+        with self.state_lock:
+            self.playing -= 1
+            if self.playing == 0:
+                self.quiet_since = time.time()
+
+    def _spawn(self, path: Path | str) -> subprocess.Popen:
+        """Start the player; call with state_lock held."""
+        self._started_playing()
         return subprocess.Popen(self.player + [str(path)],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def _reap(self, proc: subprocess.Popen) -> None:
         proc.wait()
-        with self.state_lock:
-            self.playing -= 1
-            if self.playing == 0:
-                self.quiet_since = time.time()
+        self._stopped_playing()
 
     def lead_in(self) -> float:
         """Silence to put before speech so the output has been awake for LEAD_IN."""
@@ -472,26 +498,80 @@ class Speaker:
                     if i == 0:
                         lead = np.zeros(int(self.lead_in() * rate), samples.dtype)
                         samples = np.concatenate([lead, samples])
-                    fd, path = tempfile.mkstemp(prefix="claude-speak-", suffix=".wav")
-                    with os.fdopen(fd, "wb") as fh:
-                        fh.write(wav_bytes(samples, rate))
-                    clips.put(path)
+                    clips.put((samples, rate))
             except Exception as exc:
                 log(f"synthesis failed: {exc}")
             finally:
                 clips.put(None)
 
         threading.Thread(target=produce, daemon=True).start()
-        while (path := clips.get()) is not None:
-            try:
+        stream, started, audio = None, 0.0, 0.0
+        try:
+            while (clip := clips.get()) is not None:
+                samples, rate = clip
                 with self.state_lock:
                     if job.cancelled:
                         continue
                     self._end_warm()
-                    proc = self.proc = self._spawn(path)
-                self._reap(proc)
-            finally:
-                os.unlink(path)
+                started = started or time.time()
+                audio += len(samples) / rate
+                if stream and stream.samplerate != rate:
+                    self._close_stream(stream, drain=True)
+                    stream = None
+                if self.sd and not stream:
+                    stream = self._open_stream(rate)
+                if stream:
+                    self._write(stream, samples, rate, job)
+                else:
+                    self._play_file(samples, rate, job)
+        finally:
+            if stream:
+                self._close_stream(stream, drain=not job.cancelled)
+            if DEBUG and started:
+                log(f"played {audio:.2f}s of audio in {time.time() - started:.2f}s")
+
+    def _open_stream(self, rate: int):
+        try:
+            stream = self.sd.OutputStream(samplerate=rate, channels=1, dtype="float32")
+            stream.start()
+        except Exception as exc:
+            log(f"can't open an output stream ({exc}); playing with {self.player[0]}")
+            self.sd = None
+            return None
+        with self.state_lock:
+            self._started_playing()
+        return stream
+
+    def _close_stream(self, stream, drain: bool) -> None:
+        try:
+            if drain:
+                stream.stop()  # lets the audio already written finish playing
+            else:
+                stream.abort()
+            stream.close()
+        finally:
+            self._stopped_playing()
+
+    def _write(self, stream, samples: np.ndarray, rate: int, job: Job) -> None:
+        block = int(STREAM_BLOCK_SECS * rate)
+        samples = samples.astype(np.float32, copy=False)
+        for start in range(0, len(samples), block):
+            if job.cancelled:
+                return
+            stream.write(samples[start:start + block])
+
+    def _play_file(self, samples: np.ndarray, rate: int, job: Job) -> None:
+        fd, path = tempfile.mkstemp(prefix="claude-speak-", suffix=".wav")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(wav_bytes(samples, rate))
+            with self.state_lock:
+                if job.cancelled:
+                    return
+                proc = self.proc = self._spawn(path)
+            self._reap(proc)
+        finally:
+            os.unlink(path)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -622,7 +702,7 @@ def main() -> None:
     speaker = Speaker(kokoro, clone, find_player(), silence)
     speaker.synth("Ready.", "af_heart", 1.0)  # warm up before accepting requests
     log(f"loaded {MODELS[args.model]} in {time.time() - started:.1f}s; "
-        f"player: {' '.join(speaker.player or ['none'])}; "
+        f"player: {'output stream' if speaker.sd else ' '.join(speaker.player or ['none'])}; "
         f"cloning: {'available' if clone.available else 'off'}")
 
     server = Server(str(sock), speaker, MODELS[args.model])
