@@ -210,6 +210,42 @@ def split_chunks(text: str, prev: int = 0) -> list[str]:
     return chunks
 
 
+def time_stretch(samples: np.ndarray, rate: int, speed: float) -> np.ndarray:
+    """Speed speech up or slow it down without changing its pitch (WSOLA).
+
+    Overlapping 40 ms frames are taken from the input every speed * 20 ms and
+    laid down every 20 ms. Each frame is shifted by up to 10 ms to the position
+    that best continues the frame before it, so the waveforms line up and the
+    voice doesn't warble.
+    """
+    if abs(speed - 1.0) < 0.01 or len(samples) < rate // 10:
+        return samples
+    frame = int(0.04 * rate)
+    hop_out = frame // 2
+    hop_in = hop_out * speed
+    tolerance = int(0.01 * rate)
+    window = np.hanning(frame + 1)[:-1].astype(np.float32)
+    padded = np.concatenate([samples.astype(np.float32),
+                             np.zeros(frame * 2 + tolerance, np.float32)])
+    frames = int(len(samples) / hop_in)
+    out = np.zeros(frames * hop_out + frame, np.float32)
+    norm = np.zeros_like(out)
+    start = 0
+    for k in range(frames):
+        target = int(k * hop_in)
+        if k:
+            natural = padded[start + hop_out:start + hop_out + frame]
+            lo = max(0, target - tolerance)
+            corr = np.correlate(padded[lo:target + tolerance + frame], natural, "valid")
+            start = lo + int(np.argmax(corr))
+        else:
+            start = target
+        out[k * hop_out:k * hop_out + frame] += padded[start:start + frame] * window
+        norm[k * hop_out:k * hop_out + frame] += window
+    length = int(len(samples) / speed)
+    return out[:length] / np.maximum(norm[:length], 1e-3)
+
+
 def wav_bytes(samples: np.ndarray, rate: int) -> bytes:
     pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2")
     buf = io.BytesIO()
@@ -226,7 +262,8 @@ class CloneEngine:
 
     The model loads on first use, so setups that only use Kokoro voices never
     pay for it. Speaker conditioning is computed once per reference file and
-    reused until the file changes. Chatterbox has no speed control.
+    reused until the file changes. Chatterbox has no speed control, so the
+    speaker time-stretches its output instead.
 
     All MLX work runs on one dedicated thread: it serializes cloned speech
     without holding up Kokoro during the first model download, and keeps MLX
@@ -353,7 +390,8 @@ class Speaker:
         voice = self.resolve_voice(voice)
         if voice.startswith(CLONE_PREFIX):
             try:
-                return self.clone.synth(text, voice)
+                samples, rate = self.clone.synth(text, voice)
+                return time_stretch(samples, rate, speed), rate
             except Exception as exc:
                 log(f"cloned voice {voice} failed ({exc}); using af_heart")
                 voice = "af_heart"

@@ -118,7 +118,7 @@ claude-speak voice rm me
 
 Only clone your own voice, or a voice you have permission to use.
 
-The first time a cloned voice speaks, the voice server restarts with mlx-audio and downloads the cloning model (about 1 to 2 GB), so that reply takes a while. After that, a two-sentence summary takes about 2 to 3 seconds on an M3. Cloned voices are English only, ignore the speed setting, and add about 1 GB to the server's memory while it runs. Kokoro voices work as before and never load the cloning model.
+The first time a cloned voice speaks, the voice server restarts with mlx-audio and downloads the cloning model (about 1 to 2 GB), so that reply takes a while. After that, a two-sentence summary takes about 2 to 3 seconds on an M3. Cloned voices are English only and add about 1 GB to the server's memory while it runs. Kokoro voices work as before and never load the cloning model.
 
 ## How it works
 
