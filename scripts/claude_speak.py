@@ -356,8 +356,11 @@ def summarize(text: str, model: str):
                 event = json.loads(line)
             except ValueError:
                 continue
-            delta = (event.get("event") or {}).get("delta") or {}
-            if event.get("type") != "stream_event" or delta.get("type") != "text_delta":
+            if not isinstance(event, dict) or event.get("type") != "stream_event":
+                continue
+            inner = event.get("event")
+            delta = inner.get("delta") if isinstance(inner, dict) else None
+            if not isinstance(delta, dict) or delta.get("type") != "text_delta":
                 continue
             *done, buffer = SENTENCE_END.split(buffer + delta.get("text", ""))
             for sentence in filter(str.strip, done):
