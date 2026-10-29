@@ -20,8 +20,8 @@ with `uv run --with mlx-audio` only when a clone voice is in use.
   POST /speak    {"text", "voice", "speed", "session", "label", "more"}; returns at once,
                  plays in turn. With "more": true, the rest follows through /append.
   POST /append   {"session", "text", "more"}; continue that session's /speak
-  POST /warm     {"voice"}; play silence to wake the output device before speech is
-                 ready, and load a cloned voice
+  POST /warm     {"voice", "silent"}; load a cloned voice and, unless silent, play
+                 silence to wake the output device before speech is ready
   POST /synth    same body; returns the whole utterance as a WAV
   POST /stop     stop playback and clear the queue
   POST /shutdown stop and exit, so the client can restart with other dependencies
@@ -382,8 +382,10 @@ class Speaker:
             if self.proc and self.proc.poll() is None:
                 self.proc.terminate()
 
-    def warm(self, voice: str = "") -> None:
+    def warm(self, voice: str = "", silent: bool = False) -> None:
         self.clone.preload(voice)
+        if silent:
+            return
         with self.state_lock:
             if (not self.player or self.current or self.queue
                     or any(p and p.poll() is None for p in (self.proc, self.warm_proc))):
@@ -623,7 +625,7 @@ class Handler(BaseHTTPRequestHandler):
                 log("shutdown requested; exiting")
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
             elif self.path == "/warm":
-                speaker.warm(str(body.get("voice") or ""))
+                speaker.warm(str(body.get("voice") or ""), silent=bool(body.get("silent")))
                 self._json(202, {"ok": True})
             elif self.path == "/speak" and text:
                 session = str(body.get("session") or "")

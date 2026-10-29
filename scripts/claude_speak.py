@@ -513,10 +513,11 @@ def log_error(data: Path, message: str) -> None:
 
 
 def spawn_worker(data: Path, text: str, settings: dict, force_full: bool = False,
-                 session: str = "", label: str = "") -> None:
-    """Summarize and speak in a detached process so the caller returns immediately."""
+                 session: str = "", label: str = "", preload: bool = False) -> None:
+    """Summarize and speak in a detached process so the caller returns immediately.
+    With preload, only start the server and load the voice."""
     job = {"text": text, "settings": settings, "force_full": force_full,
-           "session": session, "label": label}
+           "session": session, "label": label, "preload": preload}
     proc = subprocess.Popen(
         [sys.executable, __file__, "_worker", "--data-dir", str(data)],
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -547,6 +548,13 @@ def cmd_hook(args) -> None:
     remember_transcript(data, session_id, transcript)
     if event.get("hook_event_name") == "SessionStart":
         return
+    if event.get("hook_event_name") == "UserPromptSubmit":
+        # Start the server and load a cloned voice while Claude works, so the
+        # reply isn't kept waiting for a server that exited while idle.
+        settings = load_settings(data=data)
+        if settings["auto_speak"]:
+            spawn_worker(data, "", settings, preload=True)
+        return
 
     # /speak already spoke; don't also speak its acknowledgement.
     skip = data / f"skip-{_safe_id(session_id)}"
@@ -573,6 +581,9 @@ def cmd_worker(args) -> None:
     data = data_dir(args.data_dir)
     job = json.load(sys.stdin)
     settings, session = job["settings"], job.get("session", "")
+    if job.get("preload"):
+        _warm_up(data, settings, silent=True)
+        return
     try:
         text = job["text"]
         if not (settings["summarize"] and not job.get("force_full") and len(text) > SUMMARY_THRESHOLD):
@@ -603,10 +614,10 @@ def cmd_worker(args) -> None:
         log_error(data, f"speak failed: {exc}")
 
 
-def _warm_up(data: Path, settings: dict) -> None:
+def _warm_up(data: Path, settings: dict, silent: bool = False) -> None:
     try:
         ensure_server(data, clone=settings["voice"] in clone_voices(data))
-        request(data, "POST", "/warm", {"voice": settings["voice"]})
+        request(data, "POST", "/warm", {"voice": settings["voice"], "silent": silent})
     except Exception as exc:
         log_error(data, f"warm-up failed: {exc}")
 
